@@ -2,10 +2,10 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY // Service key for server-side writes
+  process.env.SUPABASE_SERVICE_KEY
 );
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 export async function handler(event) {
   if (event.httpMethod !== 'POST') {
@@ -34,8 +34,8 @@ export async function handler(event) {
       };
     }
 
-    // 3. Analyze with Claude Haiku
-    const analysis = await analyzeWithClaude(transcript, url);
+    // 3. Analyze with Gemini Flash (FREE!)
+    const analysis = await analyzeWithGemini(transcript, url);
 
     // 4. Save to Supabase
     const { data, error } = await supabase.from('ideas').insert({
@@ -67,57 +67,55 @@ export async function handler(event) {
 // --- YouTube Transcript Fetching ---
 
 async function fetchTranscript(videoId) {
-  // Try fetching from YouTube's timedtext API (no auth needed for public captions)
-  const languages = ['he', 'en', 'iw', 'auto'];
+  try {
+    // Fetch the video page to extract caption tracks
+    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: { 'Accept-Language': 'en-US,en;q=0.9,he;q=0.8' },
+    });
+    const pageHtml = await pageRes.text();
 
-  for (const lang of languages) {
-    try {
-      // First, get the video page to extract caption tracks
-      const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`);
-      const pageHtml = await pageRes.text();
+    // Extract captions URL from player response
+    const captionMatch = pageHtml.match(/"captionTracks":\s*(\[.*?\])/);
+    if (!captionMatch) return null;
 
-      // Extract captions URL from player response
-      const captionMatch = pageHtml.match(/"captionTracks":\s*(\[.*?\])/);
-      if (!captionMatch) continue;
+    const tracks = JSON.parse(captionMatch[1]);
+    if (!tracks.length) return null;
 
-      const tracks = JSON.parse(captionMatch[1]);
-      if (!tracks.length) continue;
+    // Prefer Hebrew, then English, then first available
+    const track =
+      tracks.find((t) => t.languageCode === 'he') ||
+      tracks.find((t) => t.languageCode === 'iw') ||
+      tracks.find((t) => t.languageCode === 'en') ||
+      tracks.find((t) => t.kind === 'asr') ||
+      tracks[0];
 
-      // Prefer the requested language, fallback to first available
-      const track =
-        tracks.find((t) => t.languageCode === lang) ||
-        tracks.find((t) => t.kind === 'asr') ||
-        tracks[0];
+    if (!track?.baseUrl) return null;
 
-      if (!track?.baseUrl) continue;
+    const captionRes = await fetch(track.baseUrl + '&fmt=json3');
+    const captionData = await captionRes.json();
 
-      const captionRes = await fetch(track.baseUrl + '&fmt=json3');
-      const captionData = await captionRes.json();
+    if (captionData.events) {
+      const text = captionData.events
+        .filter((e) => e.segs)
+        .map((e) => e.segs.map((s) => s.utf8).join(''))
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
 
-      if (captionData.events) {
-        const text = captionData.events
-          .filter((e) => e.segs)
-          .map((e) => e.segs.map((s) => s.utf8).join(''))
-          .join(' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-
-        if (text.length > 50) {
-          // Truncate to ~8000 chars to fit in Claude context
-          return text.slice(0, 8000);
-        }
+      if (text.length > 50) {
+        return text.slice(0, 8000);
       }
-    } catch {
-      continue;
     }
+  } catch {
+    // fall through
   }
 
   return null;
 }
 
-// --- Claude AI Analysis ---
+// --- Gemini AI Analysis (FREE tier!) ---
 
-async function analyzeWithClaude(transcript, videoUrl) {
+async function analyzeWithGemini(transcript, videoUrl) {
   const prompt = `אתה מנתח תוכן מיוטיוב. קיבלת תמליל של סרטון. נתח אותו והחזר JSON בלבד.
 
 תמליל הסרטון:
@@ -135,29 +133,31 @@ ${transcript}
 
 החזר JSON תקין בלבד, בלי markdown או טקסט נוסף.`;
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-20250514',
-      max_tokens: 1024,
-      messages: [{ role: 'user', content: prompt }],
-    }),
-  });
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: 1024,
+          responseMimeType: 'application/json',
+        },
+      }),
+    }
+  );
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Claude API error: ${res.status} — ${err}`);
+    throw new Error(`Gemini API error: ${res.status} — ${err}`);
   }
 
   const data = await res.json();
-  const text = data.content[0].text.trim();
+  const text = data.candidates[0].content.parts[0].text.trim();
 
-  // Parse JSON from response (handle potential markdown wrapping)
+  // Parse JSON from response
   const jsonMatch = text.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error('Failed to parse AI response');
 
