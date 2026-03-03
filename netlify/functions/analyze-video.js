@@ -7,19 +7,14 @@ const supabase = createClient(
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Browser-like headers to avoid YouTube blocking
-const BROWSER_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
-  'Accept-Encoding': 'identity',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
-  'Upgrade-Insecure-Requests': '1',
-  'Cache-Control': 'max-age=0',
-};
+// Multiple Invidious instances for fallback
+const INVIDIOUS_INSTANCES = [
+  'https://vid.puffyan.us',
+  'https://inv.tux.pizza',
+  'https://invidious.nerdvpn.de',
+  'https://inv.nadeko.net',
+  'https://invidious.protokolla.fi',
+];
 
 export async function handler(event) {
   const headers = {
@@ -49,21 +44,21 @@ export async function handler(event) {
       return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid YouTube URL' }) };
     }
 
-    // 1. Fetch transcript (try multiple methods)
-    const transcriptResult = await fetchTranscriptMultiMethod(videoId);
-    if (!transcriptResult.transcript) {
+    // 1. Get video info + transcript via Invidious
+    const videoData = await fetchVideoData(videoId);
+    if (!videoData.transcript) {
       return {
         statusCode: 400,
         headers,
         body: JSON.stringify({
-          error: transcriptResult.error || 'Could not fetch transcript',
+          error: videoData.error || 'לא הצלחתי למשוך כתוביות. נסה סרטון אחר.',
           videoId,
         }),
       };
     }
 
     // 2. Analyze with Gemini
-    const analysis = await analyzeWithGemini(transcriptResult.transcript, transcriptResult.title);
+    const analysis = await analyzeWithGemini(videoData.transcript, videoData.title);
 
     // 3. Save to Supabase
     const { data, error } = await supabase.from('ideas').insert({
@@ -93,186 +88,111 @@ export async function handler(event) {
   }
 }
 
-// --- Transcript Fetching (Multiple Methods) ---
+// --- Fetch Video Data via Invidious Instances ---
 
-async function fetchTranscriptMultiMethod(videoId) {
-  // Method 1: Direct innertube API
-  try {
-    const result = await fetchViaInnertube(videoId);
-    if (result) return result;
-  } catch (e) {
-    console.log('Innertube method failed:', e.message);
-  }
+async function fetchVideoData(videoId) {
+  const errors = [];
 
-  // Method 2: Scrape watch page
-  try {
-    const result = await fetchViaScraping(videoId);
-    if (result) return result;
-  } catch (e) {
-    console.log('Scraping method failed:', e.message);
-  }
-
-  // Method 3: Try timedtext API directly
-  try {
-    const result = await fetchViaTimedText(videoId);
-    if (result) return result;
-  } catch (e) {
-    console.log('TimedText method failed:', e.message);
-  }
-
-  return { transcript: null, title: '', error: 'לא הצלחתי למשוך כתוביות. נסה סרטון אחר עם כתוביות זמינות.' };
-}
-
-// Method 1: YouTube Innertube API (internal YouTube API)
-async function fetchViaInnertube(videoId) {
-  // First get the page to extract the visitor data
-  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: BROWSER_HEADERS,
-  });
-  const pageHtml = await pageRes.text();
-
-  // Extract video title
-  const titleMatch = pageHtml.match(/<title>([^<]*)<\/title>/);
-  const title = titleMatch ? titleMatch[1].replace(' - YouTube', '').trim() : '';
-
-  // Extract caption tracks from player response
-  const captionMatch = pageHtml.match(/"captionTracks":\s*(\[.*?\])/);
-  if (!captionMatch) {
-    return null;
-  }
-
-  let tracks;
-  try {
-    tracks = JSON.parse(captionMatch[1]);
-  } catch {
-    return null;
-  }
-
-  if (!tracks.length) return null;
-
-  // Prefer Hebrew, then English, then auto-generated, then first
-  const track =
-    tracks.find((t) => t.languageCode === 'he') ||
-    tracks.find((t) => t.languageCode === 'iw') ||
-    tracks.find((t) => t.languageCode === 'en') ||
-    tracks.find((t) => t.kind === 'asr') ||
-    tracks[0];
-
-  if (!track?.baseUrl) return null;
-
-  // Fetch the actual captions
-  const captionRes = await fetch(track.baseUrl + '&fmt=json3', {
-    headers: BROWSER_HEADERS,
-  });
-
-  if (!captionRes.ok) return null;
-
-  const captionData = await captionRes.json();
-
-  if (captionData.events) {
-    const text = captionData.events
-      .filter((e) => e.segs)
-      .map((e) => e.segs.map((s) => s.utf8).join(''))
-      .join(' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    if (text.length > 50) {
-      return { transcript: text.slice(0, 8000), title };
-    }
-  }
-
-  return null;
-}
-
-// Method 2: Simple scraping with XML format
-async function fetchViaScraping(videoId) {
-  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=en`, {
-    headers: {
-      ...BROWSER_HEADERS,
-      'Cookie': 'CONSENT=YES+; GPS=1',
-    },
-  });
-  const pageHtml = await pageRes.text();
-
-  const titleMatch = pageHtml.match(/<title>([^<]*)<\/title>/);
-  const title = titleMatch ? titleMatch[1].replace(' - YouTube', '').trim() : '';
-
-  // Try to find captions URL in the page
-  const captionUrlMatch = pageHtml.match(/"baseUrl":"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/);
-  if (!captionUrlMatch) return null;
-
-  const captionUrl = captionUrlMatch[1].replace(/\\u0026/g, '&');
-
-  const captionRes = await fetch(captionUrl, {
-    headers: BROWSER_HEADERS,
-  });
-
-  if (!captionRes.ok) return null;
-
-  const captionXml = await captionRes.text();
-
-  // Parse XML captions
-  const textSegments = [...captionXml.matchAll(/<text[^>]*>(.*?)<\/text>/gs)];
-  if (textSegments.length === 0) return null;
-
-  const text = textSegments
-    .map((m) => m[1])
-    .join(' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&#39;/g, "'")
-    .replace(/&quot;/g, '"')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (text.length > 50) {
-    return { transcript: text.slice(0, 8000), title };
-  }
-
-  return null;
-}
-
-// Method 3: Direct timedtext API
-async function fetchViaTimedText(videoId) {
-  const languages = ['he', 'iw', 'en', 'auto'];
-
-  for (const lang of languages) {
+  for (const instance of INVIDIOUS_INSTANCES) {
     try {
-      const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=json3`;
-      const res = await fetch(url, { headers: BROWSER_HEADERS });
-      if (!res.ok) continue;
+      // Get video info (title etc)
+      const infoRes = await fetch(`${instance}/api/v1/videos/${videoId}?fields=title,captions`, {
+        headers: { 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(8000),
+      });
 
-      const data = await res.json();
-      if (data.events) {
-        const text = data.events
-          .filter((e) => e.segs)
-          .map((e) => e.segs.map((s) => s.utf8).join(''))
-          .join(' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-
-        if (text.length > 50) {
-          // Get title via oEmbed
-          let title = '';
-          try {
-            const oRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
-            if (oRes.ok) {
-              const oData = await oRes.json();
-              title = oData.title || '';
-            }
-          } catch { /* */ }
-
-          return { transcript: text.slice(0, 8000), title };
-        }
+      if (!infoRes.ok) {
+        errors.push(`${instance}: ${infoRes.status}`);
+        continue;
       }
-    } catch {
+
+      const info = await infoRes.json();
+      const title = info.title || '';
+
+      if (!info.captions || info.captions.length === 0) {
+        return { transcript: null, title, error: 'לסרטון הזה אין כתוביות זמינות.' };
+      }
+
+      // Find best caption track: prefer Hebrew, then English, then first
+      const caption =
+        info.captions.find(c => c.language_code === 'he' || c.language_code === 'iw') ||
+        info.captions.find(c => c.language_code === 'en') ||
+        info.captions.find(c => c.label?.includes('auto')) ||
+        info.captions[0];
+
+      if (!caption) {
+        return { transcript: null, title, error: 'לא נמצאו כתוביות מתאימות.' };
+      }
+
+      // Fetch the caption content
+      const captionUrl = caption.url?.startsWith('http')
+        ? caption.url
+        : `${instance}${caption.url}`;
+
+      const captionRes = await fetch(captionUrl, {
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (!captionRes.ok) {
+        errors.push(`${instance} captions: ${captionRes.status}`);
+        continue;
+      }
+
+      const captionText = await captionRes.text();
+
+      // Parse VTT/SRT caption format
+      const transcript = parseCaptions(captionText);
+
+      if (transcript && transcript.length > 50) {
+        return { transcript: transcript.slice(0, 8000), title };
+      }
+
+      errors.push(`${instance}: transcript too short`);
+    } catch (e) {
+      errors.push(`${instance}: ${e.message}`);
       continue;
     }
   }
 
-  return null;
+  // All instances failed — try direct YouTube oEmbed for at least getting title
+  console.error('All Invidious instances failed:', errors.join('; '));
+  return {
+    transcript: null,
+    title: '',
+    error: `לא הצלחתי למשוך כתוביות מאף שרת. נסה שוב מאוחר יותר.`,
+  };
+}
+
+// Parse VTT/SRT caption text into plain text
+function parseCaptions(rawText) {
+  // Remove VTT header
+  let text = rawText.replace(/WEBVTT\n\n/g, '');
+
+  // Remove timestamps (00:00:00.000 --> 00:00:05.000)
+  text = text.replace(/\d{2}:\d{2}[:.]\d{2}[.,]\d{3}\s*-->\s*\d{2}:\d{2}[:.]\d{2}[.,]\d{3}/g, '');
+
+  // Remove cue numbers
+  text = text.replace(/^\d+$/gm, '');
+
+  // Remove HTML tags
+  text = text.replace(/<[^>]+>/g, '');
+
+  // Remove VTT positioning
+  text = text.replace(/align:[\w]+\s*/g, '');
+  text = text.replace(/position:[\d%]+\s*/g, '');
+
+  // Decode HTML entities
+  text = text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"');
+
+  // Clean whitespace
+  text = text.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+
+  return text;
 }
 
 // --- Gemini AI Analysis ---
