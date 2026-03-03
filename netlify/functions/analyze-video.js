@@ -7,15 +7,6 @@ const supabase = createClient(
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Multiple Invidious instances for fallback
-const INVIDIOUS_INSTANCES = [
-  'https://vid.puffyan.us',
-  'https://inv.tux.pizza',
-  'https://invidious.nerdvpn.de',
-  'https://inv.nadeko.net',
-  'https://invidious.protokolla.fi',
-];
-
 export async function handler(event) {
   const headers = {
     'Content-Type': 'application/json',
@@ -44,23 +35,22 @@ export async function handler(event) {
       return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid YouTube URL' }) };
     }
 
-    // 1. Get video info + transcript via Invidious
-    const videoData = await fetchVideoData(videoId);
-    if (!videoData.transcript) {
-      return {
-        statusCode: 400,
-        headers,
-        body: JSON.stringify({
-          error: videoData.error || 'לא הצלחתי למשוך כתוביות. נסה סרטון אחר.',
-          videoId,
-        }),
-      };
-    }
+    // Get video title via oEmbed (lightweight, always works)
+    let videoTitle = '';
+    try {
+      const oRes = await fetch(
+        `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
+      );
+      if (oRes.ok) {
+        const oData = await oRes.json();
+        videoTitle = oData.title || '';
+      }
+    } catch { /* title is optional */ }
 
-    // 2. Analyze with Gemini
-    const analysis = await analyzeWithGemini(videoData.transcript, videoData.title);
+    // Analyze with Gemini using direct YouTube URL (Gemini natively understands YouTube!)
+    const analysis = await analyzeWithGemini(videoId, videoTitle);
 
-    // 3. Save to Supabase
+    // Save to Supabase
     const { data, error } = await supabase.from('ideas').insert({
       youtube_url: url,
       video_id: videoId,
@@ -88,124 +78,14 @@ export async function handler(event) {
   }
 }
 
-// --- Fetch Video Data via Invidious Instances ---
+// --- Gemini AI Analysis (Direct YouTube Video Understanding) ---
 
-async function fetchVideoData(videoId) {
-  const errors = [];
+async function analyzeWithGemini(videoId, videoTitle) {
+  const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const titleHint = videoTitle ? `\nכותרת הסרטון: ${videoTitle}` : '';
 
-  for (const instance of INVIDIOUS_INSTANCES) {
-    try {
-      // Get video info (title etc)
-      const infoRes = await fetch(`${instance}/api/v1/videos/${videoId}?fields=title,captions`, {
-        headers: { 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(8000),
-      });
-
-      if (!infoRes.ok) {
-        errors.push(`${instance}: ${infoRes.status}`);
-        continue;
-      }
-
-      const info = await infoRes.json();
-      const title = info.title || '';
-
-      if (!info.captions || info.captions.length === 0) {
-        return { transcript: null, title, error: 'לסרטון הזה אין כתוביות זמינות.' };
-      }
-
-      // Find best caption track: prefer Hebrew, then English, then first
-      const caption =
-        info.captions.find(c => c.language_code === 'he' || c.language_code === 'iw') ||
-        info.captions.find(c => c.language_code === 'en') ||
-        info.captions.find(c => c.label?.includes('auto')) ||
-        info.captions[0];
-
-      if (!caption) {
-        return { transcript: null, title, error: 'לא נמצאו כתוביות מתאימות.' };
-      }
-
-      // Fetch the caption content
-      const captionUrl = caption.url?.startsWith('http')
-        ? caption.url
-        : `${instance}${caption.url}`;
-
-      const captionRes = await fetch(captionUrl, {
-        signal: AbortSignal.timeout(8000),
-      });
-
-      if (!captionRes.ok) {
-        errors.push(`${instance} captions: ${captionRes.status}`);
-        continue;
-      }
-
-      const captionText = await captionRes.text();
-
-      // Parse VTT/SRT caption format
-      const transcript = parseCaptions(captionText);
-
-      if (transcript && transcript.length > 50) {
-        return { transcript: transcript.slice(0, 8000), title };
-      }
-
-      errors.push(`${instance}: transcript too short`);
-    } catch (e) {
-      errors.push(`${instance}: ${e.message}`);
-      continue;
-    }
-  }
-
-  // All instances failed — try direct YouTube oEmbed for at least getting title
-  console.error('All Invidious instances failed:', errors.join('; '));
-  return {
-    transcript: null,
-    title: '',
-    error: `לא הצלחתי למשוך כתוביות מאף שרת. נסה שוב מאוחר יותר.`,
-  };
-}
-
-// Parse VTT/SRT caption text into plain text
-function parseCaptions(rawText) {
-  // Remove VTT header
-  let text = rawText.replace(/WEBVTT\n\n/g, '');
-
-  // Remove timestamps (00:00:00.000 --> 00:00:05.000)
-  text = text.replace(/\d{2}:\d{2}[:.]\d{2}[.,]\d{3}\s*-->\s*\d{2}:\d{2}[:.]\d{2}[.,]\d{3}/g, '');
-
-  // Remove cue numbers
-  text = text.replace(/^\d+$/gm, '');
-
-  // Remove HTML tags
-  text = text.replace(/<[^>]+>/g, '');
-
-  // Remove VTT positioning
-  text = text.replace(/align:[\w]+\s*/g, '');
-  text = text.replace(/position:[\d%]+\s*/g, '');
-
-  // Decode HTML entities
-  text = text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&#39;/g, "'")
-    .replace(/&quot;/g, '"');
-
-  // Clean whitespace
-  text = text.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
-
-  return text;
-}
-
-// --- Gemini AI Analysis ---
-
-async function analyzeWithGemini(transcript, videoTitle) {
-  const titleContext = videoTitle ? `\nכותרת הסרטון: ${videoTitle}\n` : '';
-
-  const prompt = `אתה מנתח תוכן מיוטיוב. קיבלת תמליל של סרטון. נתח אותו והחזר JSON בלבד.
-${titleContext}
-תמליל הסרטון:
----
-${transcript}
----
+  const prompt = `נתח את סרטון היוטיוב הזה. זהה את הרעיון המרכזי, תן סיכום, קטגוריה ותובנות מפתח.
+${titleHint}
 
 החזר JSON בדיוק בפורמט הזה (בעברית):
 {
@@ -223,7 +103,17 @@ ${transcript}
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{
+          parts: [
+            {
+              fileData: {
+                mimeType: 'video/mp4',
+                fileUri: youtubeUrl,
+              },
+            },
+            { text: prompt },
+          ],
+        }],
         generationConfig: {
           temperature: 0.3,
           maxOutputTokens: 1024,
@@ -234,11 +124,17 @@ ${transcript}
   );
 
   if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Gemini API error: ${res.status} — ${err}`);
+    const errText = await res.text();
+    console.error('Gemini error:', errText);
+    throw new Error(`Gemini API error: ${res.status}`);
   }
 
   const data = await res.json();
+
+  if (!data.candidates?.[0]?.content?.parts?.[0]?.text) {
+    throw new Error('Empty response from Gemini');
+  }
+
   const text = data.candidates[0].content.parts[0].text.trim();
 
   const jsonMatch = text.match(/\{[\s\S]*\}/);
