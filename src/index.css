@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+@theme {
+  --color-vault-bg: #0a0a1a;
+  --color-vault-card: #1a1a2e;
+  --color-vault-border: #2a2a4e;
+  --color-vault-accent: #6366f1;
+  --color-vault-glow: #818cf8;
+}
+
+body {
+  background: var(--color-vault-bg);
+  font-family: 'Segoe UI', Tahoma, sans-serif;
+}
+
+.card-hover {
+  transition: all 0.3s ease;
+}
+.card-hover:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 30px rgba(99, 102, 241, 0.2);
+}
+
+.pulse-glow {
+  animation: glow 2s ease-in-out infinite alternate;
+}
+@keyframes glow {
+  from { box-shadow: 0 0 5px rgba(99, 102, 241, 0.3); }
+  to { box-shadow: 0 0 20px rgba(99, 102, 241, 0.6); }
+}
