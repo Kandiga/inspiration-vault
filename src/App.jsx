@@ -45,13 +45,13 @@ export default function App() {
     setLoading(false);
   }
 
-  async function handleAddVideo(youtubeUrl) {
+  async function handleAddVideo(youtubeUrl, transcript) {
     setProcessing(true);
     try {
-      const res = await fetch('/.netlify/functions/analyze-video', {
+      const res = await fetch('https://agent.kandiga.bot/vault-api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: youtubeUrl }),
+        body: JSON.stringify({ url: youtubeUrl, transcript }),
       });
 
       if (!res.ok) {
@@ -59,7 +59,6 @@ export default function App() {
         throw new Error(err.error || 'Failed to analyze video');
       }
 
-      // The function saves to Supabase directly; real-time will update UI
       const data = await res.json();
       return data;
     } catch (err) {
