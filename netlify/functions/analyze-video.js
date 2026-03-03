@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { YoutubeTranscript } from 'youtube-transcript';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -8,36 +9,90 @@ const supabase = createClient(
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 export async function handler(event) {
+  // CORS headers
+  const headers = {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  };
+
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers, body: '' };
+  }
+
   if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, body: JSON.stringify({ error: 'Method not allowed' }) };
+    return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) };
   }
 
   try {
     const { url } = JSON.parse(event.body);
 
     if (!url) {
-      return { statusCode: 400, body: JSON.stringify({ error: 'URL is required' }) };
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'URL is required' }) };
     }
 
     // 1. Extract video ID
     const videoId = extractVideoId(url);
     if (!videoId) {
-      return { statusCode: 400, body: JSON.stringify({ error: 'Invalid YouTube URL' }) };
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid YouTube URL' }) };
     }
 
-    // 2. Fetch transcript
-    const transcript = await fetchTranscript(videoId);
-    if (!transcript) {
+    // 2. Fetch transcript using youtube-transcript package
+    let transcript;
+    try {
+      const transcriptItems = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'he' });
+      transcript = transcriptItems.map(item => item.text).join(' ');
+    } catch {
+      // Try English if Hebrew fails
+      try {
+        const transcriptItems = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
+        transcript = transcriptItems.map(item => item.text).join(' ');
+      } catch {
+        // Try without language preference
+        try {
+          const transcriptItems = await YoutubeTranscript.fetchTranscript(videoId);
+          transcript = transcriptItems.map(item => item.text).join(' ');
+        } catch (e) {
+          return {
+            statusCode: 400,
+            headers,
+            body: JSON.stringify({
+              error: 'לא הצלחתי למשוך כתוביות מהסרטון. ייתכן שלסרטון אין כתוביות זמינות.',
+              details: e.message,
+            }),
+          };
+        }
+      }
+    }
+
+    if (!transcript || transcript.length < 50) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ error: 'Could not fetch transcript. The video may not have captions.' }),
+        headers,
+        body: JSON.stringify({ error: 'הכתוביות קצרות מדי לניתוח.' }),
       };
     }
 
-    // 3. Analyze with Gemini Flash (FREE!)
-    const analysis = await analyzeWithGemini(transcript, url);
+    // Limit transcript length
+    transcript = transcript.slice(0, 8000);
 
-    // 4. Save to Supabase
+    // 3. Get video title from oEmbed
+    let videoTitle = '';
+    try {
+      const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+      if (oembedRes.ok) {
+        const oembedData = await oembedRes.json();
+        videoTitle = oembedData.title || '';
+      }
+    } catch {
+      // title is optional
+    }
+
+    // 4. Analyze with Gemini Flash (FREE!)
+    const analysis = await analyzeWithGemini(transcript, videoTitle);
+
+    // 5. Save to Supabase
     const { data, error } = await supabase.from('ideas').insert({
       youtube_url: url,
       video_id: videoId,
@@ -52,72 +107,26 @@ export async function handler(event) {
 
     return {
       statusCode: 200,
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ success: true, idea: data }),
     };
   } catch (err) {
     console.error('Error:', err);
     return {
       statusCode: 500,
+      headers,
       body: JSON.stringify({ error: err.message || 'Internal server error' }),
     };
   }
 }
 
-// --- YouTube Transcript Fetching ---
-
-async function fetchTranscript(videoId) {
-  try {
-    // Fetch the video page to extract caption tracks
-    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: { 'Accept-Language': 'en-US,en;q=0.9,he;q=0.8' },
-    });
-    const pageHtml = await pageRes.text();
-
-    // Extract captions URL from player response
-    const captionMatch = pageHtml.match(/"captionTracks":\s*(\[.*?\])/);
-    if (!captionMatch) return null;
-
-    const tracks = JSON.parse(captionMatch[1]);
-    if (!tracks.length) return null;
-
-    // Prefer Hebrew, then English, then first available
-    const track =
-      tracks.find((t) => t.languageCode === 'he') ||
-      tracks.find((t) => t.languageCode === 'iw') ||
-      tracks.find((t) => t.languageCode === 'en') ||
-      tracks.find((t) => t.kind === 'asr') ||
-      tracks[0];
-
-    if (!track?.baseUrl) return null;
-
-    const captionRes = await fetch(track.baseUrl + '&fmt=json3');
-    const captionData = await captionRes.json();
-
-    if (captionData.events) {
-      const text = captionData.events
-        .filter((e) => e.segs)
-        .map((e) => e.segs.map((s) => s.utf8).join(''))
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      if (text.length > 50) {
-        return text.slice(0, 8000);
-      }
-    }
-  } catch {
-    // fall through
-  }
-
-  return null;
-}
-
 // --- Gemini AI Analysis (FREE tier!) ---
 
-async function analyzeWithGemini(transcript, videoUrl) {
-  const prompt = `אתה מנתח תוכן מיוטיוב. קיבלת תמליל של סרטון. נתח אותו והחזר JSON בלבד.
+async function analyzeWithGemini(transcript, videoTitle) {
+  const titleContext = videoTitle ? `\nכותרת הסרטון: ${videoTitle}\n` : '';
 
+  const prompt = `אתה מנתח תוכן מיוטיוב. קיבלת תמליל של סרטון. נתח אותו והחזר JSON בלבד.
+${titleContext}
 תמליל הסרטון:
 ---
 ${transcript}
