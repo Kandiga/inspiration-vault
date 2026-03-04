@@ -1,21 +1,11 @@
 import { createServer } from 'http';
 import { createClient } from '@supabase/supabase-js';
-import { readFileSync } from 'fs';
-
 const PORT = process.env.PORT || 3847;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://ttkgywhqnybpoqsmbxar.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const AUTH_FILE = process.env.AUTH_FILE || '/root/.openclaw/agents/main/agent/auth.json';
 const API_SECRET = process.env.API_SECRET || '';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-// --- Read Kali's OAuth token (refreshed by OpenClaw automatically) ---
-function getAnthropicToken() {
-  const raw = readFileSync(AUTH_FILE, 'utf-8');
-  const auth = JSON.parse(raw);
-  return auth.anthropic?.access;
-}
 
 // --- HTTP Server ---
 const server = createServer(async (req, res) => {
@@ -198,10 +188,11 @@ async function fetchTranscript(videoId) {
   return { transcript: null, title: '', error: 'לא הצלחתי למשוך כתוביות אוטומטית. נסה להדביק תמליל ידנית.' };
 }
 
-// --- Claude Analysis (using Kali's OAuth token) ---
+// --- Claude Analysis (via Anthropic API with API Key) ---
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+
 async function analyzeWithClaude(transcript, videoTitle) {
-  const token = getAnthropicToken();
-  if (!token) throw new Error('No Anthropic OAuth token available');
+  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not configured');
 
   const titleCtx = videoTitle ? `\nכותרת הסרטון: ${videoTitle}\n` : '';
   const prompt = `אתה מנתח תוכן מיוטיוב. קיבלת תמליל של סרטון. נתח אותו והחזר JSON בלבד.
@@ -221,11 +212,12 @@ ${transcript}
 
 החזר JSON תקין בלבד, בלי markdown או טקסט נוסף.`;
 
+  console.log('Calling Claude API...');
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
+      'x-api-key': ANTHROPIC_API_KEY,
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
@@ -242,16 +234,14 @@ ${transcript}
 
   const data = await res.json();
   const text = data.content[0].text.trim();
+  console.log('Claude response length:', text.length);
 
   const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('Failed to parse AI response');
+  if (!jsonMatch) throw new Error('Failed to parse AI response: ' + text.slice(0, 200));
 
   const analysis = JSON.parse(jsonMatch[0]);
-
   const validCategories = ['app_idea', 'business_model', 'technology', 'inspiration', 'content'];
-  if (!validCategories.includes(analysis.category)) {
-    analysis.category = 'inspiration';
-  }
+  if (!validCategories.includes(analysis.category)) analysis.category = 'inspiration';
 
   return analysis;
 }
